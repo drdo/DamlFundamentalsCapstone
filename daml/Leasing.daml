@@ -1,0 +1,56 @@
+module Leasing where
+
+import DA.Exception (PreconditionFailed)
+import DA.Set as Set (fromList)
+
+template LeaseProposal
+  with
+    landlord : Party
+    tenant : Party
+    propertyId: Text
+    monthlyRate : Decimal
+    currency : Text
+    from : Party
+    to : Party
+  where
+    signatory from
+    observer to
+
+    ensure Set.fromList [from, to] == Set.fromList [landlord, tenant]
+
+    choice Accept : ContractId Lease
+      controller to
+      do
+        try create Lease with ..
+        catch
+          (_ : PreconditionFailed) -> abort "Invalid Lease parameters"
+
+    choice Counter : ContractId LeaseProposal
+      with
+        newMonthlyRate : Decimal
+      controller to
+      do
+        create this with
+          monthlyRate = newMonthlyRate
+          from = to
+          to = from
+
+    choice Terminate : ()
+      with
+        actor : Party
+      controller actor
+      do
+        assertMsg "Lease proposals can only be terminated by the parties involved" $
+          actor `elem` [from, to]
+
+template Lease
+  with
+    landlord : Party
+    tenant : Party
+    propertyId: Text
+    monthlyRate : Decimal
+    currency : Text
+  where
+    signatory landlord, tenant
+
+    ensure monthlyRate >= 0.0

@@ -1,0 +1,189 @@
+module Test where
+
+import DA.Action (void)
+import DA.Assert ((===))
+import DA.Optional (isNone)
+import DA.Set qualified as Set (fromList)
+import Daml.Script
+
+import Leasing
+
+landlordInitiated : Script ()
+landlordInitiated = void $ setup >>= \Setup{..} -> do
+  -- Alice proposes a lease to bob
+  proposalCid <- createProposal alice bob 1000.0 alice bob
+
+  counterFail alice proposalCid 1100.0 -- Alice cannot counter her own proposal
+  counterFail charlie proposalCid 1100.0 -- Third party cannot counter the proposal
+  terminateFail charlie proposalCid -- Third party cannot terminate the proposal
+  acceptFail alice proposalCid -- Alice cannot accept her own proposal
+  acceptFail charlie proposalCid -- Third party cannot accept the proposal
+
+  -- Bob counters
+  proposalCid <- counter bob proposalCid 850.0
+
+  counterFail bob proposalCid 800.0 -- Bob cannot counter his own proposal
+  counterFail charlie proposalCid 999.0 -- Third party cannot counter the proposal
+  terminateFail charlie proposalCid -- Third party cannot terminate the proposal
+  acceptFail bob proposalCid -- Bob cannot accept his own proposal
+  acceptFail charlie proposalCid -- Third party cannot accept the proposal
+
+  -- Alice counters
+  proposalCid <- counter alice proposalCid 900.0
+
+  -- Bob accepts
+  accept bob proposalCid
+
+tenantInitiated : Script ()
+tenantInitiated = void $ setup >>= \Setup{..} -> do
+  -- Bob proposes a lease to alice
+  proposalCid <- createProposal alice bob 1000.0 bob alice
+
+  -- Alice counters
+  proposalCid <- counter alice proposalCid 850.0
+
+  -- Bob accepts
+  accept bob proposalCid
+
+recall : Script ()
+recall = setup >>= \Setup{..} -> do
+  -- Alice proposes a lease to bob
+  proposalCid <- createProposal alice bob 1000.0 alice bob
+
+  -- Alice decides to recall the lease proposal
+  terminate alice proposalCid
+
+  assertMsg "There should be no active leases" =<< null <$> query @Lease everyone 
+
+reject : Script ()
+reject = setup >>= \Setup{..} -> do
+  -- Alice proposes a lease to bob
+  proposalCid <- createProposal alice bob 1000.0 alice bob
+
+  -- Bob rejects the proposal
+  terminate bob proposalCid
+
+  assertMsg "There should be no active leases" =<< null <$> query @Lease everyone 
+
+-- | Exercising archiving choices for 100% choice coverage
+archiving: Script ()
+archiving = setup >>= \Setup{..} -> do
+  proposalCid <- createProposal alice bob 1000.0 alice bob
+  submit alice $ archiveCmd proposalCid
+
+  proposalCid <- createProposal alice bob 1000.0 alice bob
+  leaseCid <- submit bob $ exerciseCmd proposalCid Accept
+  submitMulti [alice, bob] [] $ archiveCmd leaseCid
+
+--------------------------------------------------------------------------------
+createProposal
+  : Party -> Party -> Decimal -> Party -> Party -> Script (ContractId LeaseProposal)
+createProposal landlord tenant monthlyRate from to = do
+  proposalCid <- submit from $ createCmd LeaseProposal with
+    landlord
+    tenant
+    propertyId = "12345"
+    monthlyRate
+    currency = "USD"
+    from
+    to
+  Some proposal <- queryContractId landlord proposalCid
+  -- The stakeholders of the proposal should be the landlord and tenant
+  Set.fromList (signatory proposal <> observer proposal) === Set.fromList [landlord, tenant]
+  pure proposalCid
+
+counter
+  : Party -> ContractId LeaseProposal -> Decimal -> Script (ContractId LeaseProposal)
+counter actor proposalCid newMonthlyRate = do
+  Some proposal <- queryContractId actor proposalCid
+  proposalCid' <- submit actor $ exerciseCmd proposalCid Counter with newMonthlyRate
+  Some proposal' <- queryContractId actor proposalCid'
+  assertMsg "Only the monthlyRate and from/to should change when countering a proposal" $ 
+    proposal' == proposal with
+      monthlyRate = newMonthlyRate
+      from = proposal.to
+      to = proposal.from
+  -- The stakeholders of the proposal should be the landlord and tenant
+  Set.fromList (signatory proposal' <> observer proposal')
+    === Set.fromList [proposal'.landlord, proposal'.tenant]
+  cannotSee "The old lease proposal should be archived" actor proposalCid
+  pure proposalCid'
+
+counterFail : Party -> ContractId LeaseProposal -> Decimal -> Script ()
+counterFail actor proposalCid newMonthlyRate = 
+  submitMustFail actor $ exerciseCmd proposalCid Counter with newMonthlyRate
+
+accept : Party -> ContractId LeaseProposal -> Script (ContractId Lease)
+accept actor proposalCid = do
+  Some proposal <- queryContractId actor proposalCid
+  leaseCid <- submit actor $ exerciseCmd proposalCid Accept
+  Some lease <- queryContractId actor leaseCid
+  cannotSee "The lease proposal should be terminated" actor proposalCid
+  assertMsg "The final lease parameters should be identical to the lease proposal" $
+    leaseParams proposal == leaseParams lease
+  -- The stakeholders of the proposal should be the landlord and tenant
+  Set.fromList (signatory lease <> observer lease)
+    === Set.fromList [lease.landlord, lease.tenant]
+  pure leaseCid
+
+acceptFail : Party -> ContractId LeaseProposal -> Script ()
+acceptFail actor proposalCid = submitMustFail actor $ exerciseCmd proposalCid Accept
+
+terminate : Party -> ContractId LeaseProposal -> Script ()
+terminate actor proposalCid = do
+  submit actor $ exerciseCmd proposalCid Terminate with actor
+  cannotSee "The lease proposal should be terminated" actor proposalCid
+
+terminateFail : Party -> ContractId LeaseProposal -> Script ()
+terminateFail actor proposalCid =
+  submitMustFail actor $ exerciseCmd proposalCid Terminate with actor
+
+--------------------------------------------------------------------------------
+cannotSee
+  : (Template t, HasAgreement t, IsParties p) => Text -> p -> ContractId t -> Script ()
+cannotSee msg party cid = assertMsg msg =<< isNone <$> queryContractId party cid
+
+leaseParams
+  : ( HasField "currency" r Text
+    , HasField "landlord" r Party
+    , HasField "monthlyRate" r Decimal
+    , HasField "tenant" r Party
+    )
+ => r -> LeaseParams
+leaseParams x = LeaseParams with
+  landlord = x.landlord
+  tenant = x.tenant
+  monthlyRate = x.monthlyRate
+  currency = x.currency
+
+data LeaseParams = LeaseParams
+  with
+    landlord : Party
+    tenant : Party
+    monthlyRate : Decimal
+    currency : Text
+  deriving (Eq)
+
+--------------------------------------------------------------------------------
+data Setup = Setup
+  with
+    alice : Party
+    bob : Party
+    charlie : Party
+    everyone : [Party]
+  
+setup : Script Setup
+setup = script do
+  let setupUser : Text -> Script Party
+      setupUser name = do
+        party <- allocatePartyWithHint name (PartyIdHint name)
+        userId <- validateUserId name 
+        createUser (User userId (Some party)) [CanActAs party]
+        pure party
+
+  alice <- setupUser "Alice"
+  bob <- setupUser "Bob"
+  charlie <- setupUser "Charlie"
+  let everyone = [alice, bob, charlie]
+
+  pure Setup with ..
